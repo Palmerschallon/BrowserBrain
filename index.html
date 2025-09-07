@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Browser Brain — Controller</title>
+  <style>
+    :root{ --bg:#0b0b0b; --ink:#e8e8e8; --edge:#1e1e1e; --muted:#9a9a9a; --red:#e53935; }
+    html,body{height:100%}
+    body{margin:0;background:#000 radial-gradient(160% 100% at 50% 0%, #171717 0%, var(--bg) 60%, #000 100%) no-repeat;
+      color:var(--ink);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+    a{color:inherit;text-decoration:none;border-bottom:1px solid #777}
+    .wrap{max-width:1100px;margin:16px auto;padding:12px}
+    header h1{margin:.2rem 0 .4rem;font-size:clamp(1.4rem,4.8vw,2.2rem);line-height:1.05}
+    header p{margin:0;color:#c8c8c8}
+    .panel{display:grid;gap:10px;grid-template-columns:1fr; margin:14px 0 10px; background:#0f0f0f;border:1px solid var(--edge);
+      border-radius:10px;padding:10px;box-shadow:0 0 0 1px rgba(255,255,255,.02) inset;}
+    .row{display:grid;grid-template-columns:repeat(2, minmax(0,1fr)); gap:8px}
+    .row > div{display:flex;flex-direction:column;gap:6px}
+    label{font-size:.78rem;color:#b0b0b0}
+    input[type="number"],input[type="range"],select,button{
+      padding:10px;border-radius:8px;border:1px solid #2a2a2a;background:#101010;color:var(--ink);
+    }
+    button{cursor:pointer}
+    .grid{display:grid;gap:8px;grid-template-columns:repeat(2,minmax(0,1fr)); margin-top:10px}
+    .cell{background:#0f0f0f;border:1px solid var(--edge);border-radius:10px;overflow:hidden;min-height:180px}
+    iframe{display:block;width:100%;height:220px;border:0;background:#0b0b0b}
+    @media (min-width:900px){ .grid{grid-template-columns:repeat(3,minmax(0,1fr));} iframe{height:260px} }
+    .status{margin-top:10px;color:#bdbdbd;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9rem;white-space:pre-wrap}
+    .bar{height:8px;background:#141414;border:1px solid #202020;border-radius:5px;overflow:hidden}
+    .bar > i{display:block;height:100%;width:0;background:linear-gradient(90deg,#6b6b6b,#c9c9c9)}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Browser Brain — Controller</h1>
+      <p>Spawn tabs/iframes as neurons. They communicate via <code>BroadcastChannel</code>, learn simple weights, and spike when their membrane passes a threshold.</p>
+    </header>
+
+    <section class="panel">
+      <div class="row">
+        <div>
+          <label>Neurons</label>
+          <input id="neurons" type="number" min="1" max="48" value="9" />
+        </div>
+        <div>
+          <label>Connections per neuron (fan-out)</label>
+          <input id="fanout" type="number" min="1" max="12" value="3" />
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Threshold (spike when V ≥ threshold)</label>
+          <input id="threshold" type="number" min="0.2" max="5" step="0.1" value="1.0" />
+        </div>
+        <div>
+          <label>Decay per tick (leak)</label>
+          <input id="decay" type="number" min="0" max="1" step="0.01" value="0.05" />
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Noise (background random input)</label>
+          <input id="noise" type="range" min="0" max="1" step="0.01" value="0.08" />
+        </div>
+        <div>
+          <label>Learning Rate (Hebbian-ish)</label>
+          <input id="lr" type="range" min="0" max="0.5" step="0.01" value="0.05" />
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <button id="spawn">Spawn / Reset Network</button>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button id="stimA">Stim A</button>
+          <button id="stimB">Stim B</button>
+          <button id="toggle">Start/Stop</button>
+        </div>
+      </div>
+      <div>
+        <label>Network Activity</label>
+        <div class="bar"><i id="activity"></i></div>
+      </div>
+    </section>
+
+    <section class="grid" id="grid"></section>
+    <div class="status" id="status"></div>
+  </div>
+
+  <script>
+    const bc = new BroadcastChannel('brain');
+    const control = new BroadcastChannel('brain-control');
+
+    let running = false;
+    let tick = 0;
+    let neurons = [];
+    let netConfig = {
+      fanout: 3, threshold: 1.0, decay: 0.05, noise: 0.08, lr: 0.05
+    };
+
+    const els = {
+      neurons: document.getElementById('neurons'),
+      fanout: document.getElementById('fanout'),
+      threshold: document.getElementById('threshold'),
+      decay: document.getElementById('decay'),
+      noise: document.getElementById('noise'),
+      lr: document.getElementById('lr'),
+      spawn: document.getElementById('spawn'),
+      stimA: document.getElementById('stimA'),
+      stimB: document.getElementById('stimB'),
+      toggle: document.getElementById('toggle'),
+      grid: document.getElementById('grid'),
+      status: document.getElementById('status'),
+      activity: document.getElementById('activity'),
+    };
+
+    const uuid = () => Math.random().toString(36).slice(2, 10);
+
+    function log(line){
+      const t = new Date().toLocaleTimeString();
+      els.status.textContent = "["+t+"] " + line + "\n" + els.status.textContent;
+    }
+
+    function spawn(){
+      netConfig = {
+        fanout: parseInt(els.fanout.value,10),
+        threshold: parseFloat(els.threshold.value),
+        decay: parseFloat(els.decay.value),
+        noise: parseFloat(els.noise.value),
+        lr: parseFloat(els.lr.value)
+      };
+      const count = Math.min(48, Math.max(1, parseInt(els.neurons.value,10)));
+
+      els.grid.innerHTML = '';
+      neurons = [];
+      tick = 0;
+      running = false;
+      els.activity.style.width = '0%';
+
+      for (let i=0;i<count;i++){
+        const id = "n-" + uuid();
+        const cell = document.createElement('div');
+        cell.className = 'cell';
+        const fr = document.createElement('iframe');
+        fr.src = 'neuron.html#' + id;
+        fr.title = id;
+        cell.appendChild(fr);
+        els.grid.appendChild(cell);
+        neurons.push({ id, iframe: fr });
+      }
+
+      const registry = neurons.map(n => n.id);
+      control.postMessage({ type:'registry', ids: registry, config: netConfig });
+      log("Spawned " + count + " neurons. Fan-out " + netConfig.fanout);
+    }
+
+    function start(){
+      running = true;
+      control.postMessage({ type:'run', on: true });
+      log("Run = true");
+    }
+    function stop(){
+      running = false;
+      control.postMessage({ type:'run', on: false });
+      log("Run = false");
+    }
+
+    let spikesThisSecond = 0;
+    let lastUpdate = performance.now();
+    bc.onmessage = (e) => {
+      const msg = e.data;
+      if (msg && msg.type === 'spike'){
+        spikesThisSecond++;
+      }
+    };
+    function loop(ts){
+      if (running){
+        tick++;
+        if (ts - lastUpdate >= 1000){
+          const p = Math.min(100, (spikesThisSecond/neurons.length)*5*100/100);
+          els.activity.style.width = p + '%';
+          spikesThisSecond = 0; lastUpdate = ts;
+        }
+      }
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+
+    function stim(tag){
+      const targets = neurons.filter((n,i)=> (i + (tag==='B'?1:0)) % 3 === 0).map(n=>n.id);
+      bc.postMessage({ type:'stimulus', tag, targets, strength: 0.7 });
+      log("Stimulus "+tag+" -> " + targets.length + " neurons");
+    }
+
+    els.spawn.addEventListener('click', spawn);
+    els.toggle.addEventListener('click', ()=> running ? stop() : start());
+    els.stimA.addEventListener('click', ()=> stim('A'));
+    els.stimB.addEventListener('click', ()=> stim('B'));
+
+    spawn();
+  </script>
+
+  <!-- Optional Chaos Mode -->
+  <script src="chaos-mode.js" defer></script>
+</body>
+</html>
